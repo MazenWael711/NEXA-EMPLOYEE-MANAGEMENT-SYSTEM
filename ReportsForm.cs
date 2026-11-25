@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -15,7 +17,8 @@ namespace NEXA
         private Panel reportBody;
         private Label pageTitle, pageSubtitle, departmentTitle, hiringTitle, salaryTitle, reportNote;
         private DataGridView departmentGrid;
-        private Chart hiringChart, salaryBandChart;
+        private Chart hiringChart;
+        private Panel gdiSalaryPanel;
         private Button btnExport;
         public bool LogoutRequested { get; private set; }
 
@@ -102,11 +105,16 @@ namespace NEXA
 
             hiringTitle = SectionTitle("Monthly Payroll by Department");
             hiringChart = CreateReportChart();
-            salaryTitle = SectionTitle("Average Salary by Department");
-            salaryBandChart = CreateReportChart();
+            salaryTitle = SectionTitle("Average Salary by Department — GDI+ Graphics");
+            gdiSalaryPanel = new Panel
+            {
+                BackColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+            gdiSalaryPanel.Paint += DrawGdiSalaryChart;
             reportNote = new Label { Font = new Font("Segoe UI", 8.5f), ForeColor = muted, AutoSize = true };
 
-            reportBody.Controls.AddRange(new Control[] { pageTitle, pageSubtitle, btnExport, departmentTitle, departmentGrid, hiringTitle, hiringChart, salaryTitle, salaryBandChart, reportNote });
+            reportBody.Controls.AddRange(new Control[] { pageTitle, pageSubtitle, btnExport, departmentTitle, departmentGrid, hiringTitle, hiringChart, salaryTitle, gdiSalaryPanel, reportNote });
         }
 
         private Label SectionTitle(string text)
@@ -188,33 +196,10 @@ namespace NEXA
 
             hiringChart.Series.Add(payrollSeries);
 
-            // Chart 2: average salary by department.
-            salaryBandChart.Series.Clear();
-            salaryBandChart.Legends[0].Enabled = false;
-            salaryBandChart.ChartAreas[0].AxisX.Minimum = 0;
-            salaryBandChart.ChartAreas[0].AxisX.Title = "Average salary (EGP)";
-            salaryBandChart.ChartAreas[0].AxisX.LabelStyle.Format = "N0";
-            salaryBandChart.ChartAreas[0].AxisY.Title = "Department";
-
-            Series averageSalarySeries = new Series("Average Salary")
-            {
-                ChartType = SeriesChartType.Bar,
-                IsValueShownAsLabel = true,
-                LabelFormat = "N0",
-                Font = new Font("Segoe UI", 8, FontStyle.Bold),
-                Color = Color.FromArgb(70, 145, 190),
-                ChartArea = "Main"
-            };
-
-            foreach (var group in departmentGroups)
-                averageSalarySeries.Points.AddXY(group.Key, group.Average(emp => emp.Salary));
-
-            if (averageSalarySeries.Points.Count == 0)
-                averageSalarySeries.Points.AddXY("No data", 0);
-
-            salaryBandChart.Series.Add(averageSalarySeries);
-            salaryBandChart.ChartAreas[0].AxisY.MajorGrid.Enabled = false;
-            salaryBandChart.ChartAreas[0].AxisX.MajorGrid.LineColor = Color.FromArgb(235, 238, 241);
+            // The second visualization is drawn directly with GDI+ in
+            // gdiSalaryPanel.Paint (Graphics, Pen, Brush and DrawString).
+            // It is data-driven and refreshes whenever the report is refreshed.
+            gdiSalaryPanel.Invalidate();
 
             reportNote.Text = "Report generated: " + DateTime.Now.ToString("dd MMM yyyy, hh:mm tt") + "   |   Figures are calculated from the current employee records.";
         }
@@ -246,13 +231,117 @@ namespace NEXA
             hiringTitle.SetBounds(pad, chartsTop, chartAreaWidth, 24);
             hiringChart.SetBounds(pad, chartsTop + 28, chartAreaWidth, chartHeight);
             salaryTitle.SetBounds(pad + chartAreaWidth + gap, chartsTop, chartAreaWidth, 24);
-            salaryBandChart.SetBounds(pad + chartAreaWidth + gap, chartsTop + 28, chartAreaWidth, chartHeight);
+            gdiSalaryPanel.SetBounds(pad + chartAreaWidth + gap, chartsTop + 28, chartAreaWidth, chartHeight);
             if (inner < 760)
             {
                 salaryTitle.SetBounds(pad, chartsTop + chartHeight + 38, inner, 24);
-                salaryBandChart.SetBounds(pad, chartsTop + chartHeight + 66, inner, 220);
+                gdiSalaryPanel.SetBounds(pad, chartsTop + chartHeight + 66, inner, 220);
             }
             reportNote.SetBounds(pad, reportBody.Height - 27, inner, 20);
+        }
+
+        // GDI+ implementation: draws a horizontal average-salary chart.
+        // This is the explicit Graphics/Visualization component required by CS312.
+        private void DrawGdiSalaryChart(object sender, PaintEventArgs e)
+        {
+            Graphics graphics = e.Graphics;
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            int width = gdiSalaryPanel.ClientSize.Width;
+            int height = gdiSalaryPanel.ClientSize.Height;
+            graphics.Clear(Color.White);
+
+            using (Font labelFont = new Font("Segoe UI", 8.5f, FontStyle.Regular))
+            using (Font valueFont = new Font("Segoe UI", 8f, FontStyle.Bold))
+            using (Font emptyFont = new Font("Segoe UI", 10f, FontStyle.Italic))
+            using (SolidBrush textBrush = new SolidBrush(navy))
+            using (SolidBrush mutedBrush = new SolidBrush(muted))
+            using (Pen gridPen = new Pen(Color.FromArgb(232, 237, 241), 1))
+            using (Pen axisPen = new Pen(Color.FromArgb(185, 195, 204), 1))
+            {
+                var groups = EmployeeData.Employees
+                    .Where(emp => !string.IsNullOrWhiteSpace(emp.Department))
+                    .GroupBy(emp => emp.Department)
+                    .Select(group => new
+                    {
+                        Department = group.Key,
+                        AverageSalary = (double)group.Average(emp => emp.Salary)
+                    })
+                    .OrderByDescending(item => item.AverageSalary)
+                    .ToList();
+
+                if (groups.Count == 0)
+                {
+                    const string emptyMessage = "No salary data available yet";
+                    SizeF messageSize = graphics.MeasureString(emptyMessage, emptyFont);
+                    graphics.DrawString(emptyMessage, emptyFont, mutedBrush,
+                        Math.Max(12, (width - messageSize.Width) / 2),
+                        Math.Max(12, (height - messageSize.Height) / 2));
+                    return;
+                }
+
+                int left = 112;
+                int right = 58;
+                int top = 18;
+                int bottom = 34;
+                int chartWidth = Math.Max(40, width - left - right);
+                int chartHeight = Math.Max(30, height - top - bottom);
+                double maxValue = Math.Max(1, groups.Max(item => item.AverageSalary));
+                int rowHeight = Math.Max(25, chartHeight / groups.Count);
+                int barHeight = Math.Max(10, Math.Min(23, rowHeight - 10));
+
+                // Vertical grid lines and salary scale are drawn with GDI+ Pen.
+                for (int tick = 0; tick <= 4; tick++)
+                {
+                    int x = left + (chartWidth * tick / 4);
+                    graphics.DrawLine(gridPen, x, top, x, top + chartHeight);
+                    string tickText = (maxValue * tick / 4).ToString("N0");
+                    SizeF tickSize = graphics.MeasureString(tickText, labelFont);
+                    graphics.DrawString(tickText, labelFont, mutedBrush,
+                        x - tickSize.Width / 2, top + chartHeight + 7);
+                }
+
+                Color[] barColors =
+                {
+                    Color.FromArgb(35, 105, 145),
+                    Color.FromArgb(55, 132, 170),
+                    Color.FromArgb(82, 157, 188),
+                    Color.FromArgb(112, 178, 202),
+                    Color.FromArgb(145, 198, 215)
+                };
+
+                for (int i = 0; i < groups.Count; i++)
+                {
+                    var item = groups[i];
+                    int centerY = top + (i * chartHeight / groups.Count) + rowHeight / 2;
+                    int barY = centerY - barHeight / 2;
+                    int barWidth = (int)(chartWidth * item.AverageSalary / maxValue);
+                    barWidth = Math.Max(item.AverageSalary > 0 ? 2 : 0, barWidth);
+
+                    string departmentName = item.Department;
+                    SizeF nameSize = graphics.MeasureString(departmentName, labelFont);
+                    float nameY = centerY - nameSize.Height / 2;
+                    graphics.DrawString(departmentName, labelFont, textBrush,
+                        Math.Max(4, left - nameSize.Width - 12), nameY);
+
+                    // FillRectangle and DrawRectangle demonstrate GDI+ brushes and pens.
+                    using (SolidBrush barBrush = new SolidBrush(barColors[i % barColors.Length]))
+                    using (Pen barOutline = new Pen(Color.FromArgb(25, navy), 1))
+                    {
+                        Rectangle barRect = new Rectangle(left, barY, barWidth, barHeight);
+                        graphics.FillRectangle(barBrush, barRect);
+                        graphics.DrawRectangle(barOutline, barRect);
+                    }
+
+                    string valueText = "EGP " + item.AverageSalary.ToString("N0");
+                    graphics.DrawString(valueText, valueFont, textBrush,
+                        Math.Min(width - right + 5, left + barWidth + 6),
+                        centerY - valueFont.GetHeight(graphics) / 2);
+                }
+
+                graphics.DrawLine(axisPen, left, top + chartHeight, left + chartWidth, top + chartHeight);
+            }
         }
 
         private void ExportDepartmentReport(object sender, EventArgs args)
